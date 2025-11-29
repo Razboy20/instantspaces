@@ -1,4 +1,4 @@
-CC=clang
+CC=xcrun clang
 CFLAGS_COMMON=-mmacosx-version-min=14.0 -Wall -O2
 FRAMEWORKS=-framework Cocoa
 EXPORTS=-Wl,-exported_symbol,_instantspaces_patch -Wl,-exported_symbol,_instantspaces_verify
