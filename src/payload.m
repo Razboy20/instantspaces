@@ -1,3 +1,8 @@
+// instantspaces payload - patches Dock animation timings in-process
+//
+// Injected into Dock via LLDB/scripting addition. Searches for ARM64 instruction
+// patterns that control animation durations, then patches them to near-instant values.
+
 #import <Cocoa/Cocoa.h>
 #import <mach/mach.h>
 #import <mach/mach_vm.h>
@@ -11,106 +16,158 @@
 #include <unistd.h>
 #include <limits.h>
 
-// Feature categories for selective patching
+// ============================================================================
+#pragma mark - Configuration Types
+// ============================================================================
+
 typedef enum {
     FEATURE_SPACES   = 1 << 0,
     FEATURE_MINIMIZE = 1 << 1,
     FEATURE_ALL      = FEATURE_SPACES | FEATURE_MINIMIZE,
 } FeatureFlags;
 
-// macOS version targeting
 typedef enum {
-    OS_ANY     = 0,  // Works on all versions
-    OS_SONOMA  = 14, // macOS 14
-    OS_SEQUOIA = 15, // macOS 15
+    OS_ANY     = 0,
+    OS_SONOMA  = 14,
+    OS_SEQUOIA = 15,
 } OSVersion;
 
-// Pattern specification with metadata
 typedef struct {
-    const char  *pattern;      // Hex pattern to match
-    int          patch_offset; // Byte offset within match to apply patch
-    const char  *name;         // Descriptive name for logging
-    FeatureFlags feature;      // Which feature this pattern belongs to
-    OSVersion    os_target;    // Target OS (OS_ANY = all versions)
-    OSVersion    os_fallback;  // Fallback: try if os_target didn't match (OS_ANY = no fallback)
+    const char   *pattern;       // Hex pattern with ?? wildcards
+    int           patch_offset;  // Byte offset to instruction to replace
+    const char   *name;          // Identifier for logging
+    FeatureFlags  feature;       // Which feature category
+    OSVersion     os_min;        // Minimum OS version (0 = no minimum)
+    OSVersion     os_max;        // Maximum OS version (0 = no maximum)
 } PatternSpec;
 
+// ============================================================================
+#pragma mark - Pattern Definitions
+// ============================================================================
+
+// Spaces: patch fmov d0, #0.5 instruction at match start
+// Minimize: patch fmov s8/s0 instruction at specified offset
+//
+// os_min/os_max define version range (inclusive). Use 0 for unbounded.
+// Examples: {.os_min=14, .os_max=14} = Sonoma only
+//           {.os_min=15, .os_max=0}  = Sequoia and later
+//           {.os_min=0,  .os_max=0}  = all versions
+
+static PatternSpec g_patterns[] = {
+    // Spaces - Sonoma only
+    {
+        .pattern      = "00 10 6A 1E E0 03 14 AA ?? 03 ?? AA",
+        .patch_offset = 0,
+        .name         = "spaces-sonoma",
+        .feature      = FEATURE_SPACES,
+        .os_min       = OS_SONOMA,
+        .os_max       = OS_SONOMA,
+    },
+    // Spaces - Sequoia and later
+    {
+        .pattern      = "00 10 6A 1E A8 ?? ?? D1 ?? 01 ?? F8",
+        .patch_offset = 0,
+        .name         = "spaces-sequoia",
+        .feature      = FEATURE_SPACES,
+        .os_min       = OS_SEQUOIA,
+        .os_max       = 0,
+    },
+    // Minimize - all versions
+    {
+        .pattern      = "E1 87 00 AD 08 1C 28 1E",
+        .patch_offset = 4,
+        .name         = "minimize",
+        .feature      = FEATURE_MINIMIZE,
+        .os_min       = 0,
+        .os_max       = 0,
+    },
+    // Unminimize - all versions
+    {
+        .pattern      = "08 0D 20 1E 00 E4 00 6F E0 83 01 AD",
+        .patch_offset = 0,
+        .name         = "maximize",
+        .feature      = FEATURE_MINIMIZE,
+        .os_min       = 0,
+        .os_max       = 0,
+    },
+};
+
+static const int g_pattern_count = sizeof(g_patterns) / sizeof(g_patterns[0]);
+
+// ============================================================================
+#pragma mark - Global State
+// ============================================================================
+
 static int g_log_fd = -1;
+static uint64_t g_patched_addrs[64];
+static int g_patched_count = 0;
+
+// ============================================================================
+#pragma mark - Logging
+// ============================================================================
+
 static void log_line(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    { va_list cp; va_copy(cp, ap); char buf[1024]; vsnprintf(buf, sizeof(buf), fmt, cp); va_end(cp); NSLog(@"[instantspaces] %s", buf); }
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    // Console.app via NSLog
+    NSLog(@"[instantspaces] %s", buf);
+
+    // File log for debugging
     if (g_log_fd == -1) {
-        char path[PATH_MAX]; snprintf(path, sizeof(path), "/private/var/tmp/instantspaces.%d.log", getpid());
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "/private/var/tmp/instantspaces.%d.log", getpid());
         g_log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     }
-    if (g_log_fd != -1) { char line[1024]; vsnprintf(line, sizeof(line), fmt, ap); write(g_log_fd, line, (unsigned)strlen(line)); write(g_log_fd, "\n", 1); fsync(g_log_fd); }
-    va_end(ap);
+    if (g_log_fd != -1) {
+        write(g_log_fd, buf, strlen(buf));
+        write(g_log_fd, "\n", 1);
+        fsync(g_log_fd);
+    }
 }
 
-static inline int hexval(char c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return 10+(c-'a'); if(c>='A'&&c<='F')return 10+(c-'A'); return -1; }
-static size_t parse_pattern(const char *p,unsigned char *bytes,unsigned char *mask,size_t cap){
-    size_t n=0; while(*p && n<cap){ while(*p==' ') p++; if(!*p) break;
-        if(p[0]=='?'&&p[1]=='?'){ bytes[n]=0; mask[n]=0; n++; p+=2; }
-        else { int hi=hexval(p[0]), lo=hexval(p[1]); if(hi<0||lo<0) break; bytes[n]=(unsigned char)((hi<<4)|lo); mask[n]=1; n++; p+=2; }
-        if(*p==' ') p++;
-    } return n;
-}
-static size_t search_buf(const unsigned char *buf,size_t buflen,const unsigned char *pat,const unsigned char *msk,size_t patlen,size_t start_off){
-    if(!buf||patlen==0||buflen<patlen||start_off>buflen-patlen) return SIZE_MAX;
-    size_t limit=buflen-patlen; for(size_t i=start_off;i<=limit;i++){ size_t j=0;
-        for(;j<patlen;j++){ if(!msk[j]) continue; if(buf[i+j]!=pat[j]) break; }
-        if(j==patlen) return i;
-    } return SIZE_MAX;
-}
+// ============================================================================
+#pragma mark - Configuration
+// ============================================================================
 
-static BOOL find_dock_text(uint64_t *out_text_start,uint64_t *out_text_size){
-    uint32_t count=_dyld_image_count();
-    for(uint32_t i=0;i<count;i++){
-        const char *name=_dyld_get_image_name(i); if(!name) continue;
-        if(!strstr(name,"/Dock.app/Contents/MacOS/Dock")) continue;
-        const struct mach_header_64 *mh=(const struct mach_header_64*)_dyld_get_image_header(i);
-        if(!mh||mh->magic!=MH_MAGIC_64) continue;
-        intptr_t slide=_dyld_get_image_vmaddr_slide(i);
-        const uint8_t *cur=(const uint8_t*)(mh+1);
-        for(uint32_t c=0;c<mh->ncmds;c++){
-            const struct load_command *lc=(const struct load_command*)cur;
-            if(lc->cmd==LC_SEGMENT_64){
-                const struct segment_command_64 *seg=(const struct segment_command_64*)cur;
-                if(strcmp(seg->segname,"__TEXT")==0){
-                    *out_text_start=seg->vmaddr + (uint64_t)slide;
-                    *out_text_size =seg->vmsize;
-                    return YES;
+// Config file written by loader before injection (takes precedence over env vars)
+#define CONFIG_PATH "/private/var/tmp/instantspaces.conf"
+
+static char g_mode[16] = "zero";
+static char g_features[16] = "all";
+
+static void load_config(void) {
+    // Try config file first (used by loader)
+    FILE *f = fopen(CONFIG_PATH, "r");
+    if (f) {
+        char line[64];
+        while (fgets(line, sizeof(line), f)) {
+            char key[32], val[32];
+            if (sscanf(line, "%31[^=]=%31s", key, val) == 2) {
+                if (strcmp(key, "mode") == 0) {
+                    strncpy(g_mode, val, sizeof(g_mode) - 1);
+                } else if (strcmp(key, "features") == 0) {
+                    strncpy(g_features, val, sizeof(g_features) - 1);
                 }
             }
-            cur += lc->cmdsize;
         }
+        fclose(f);
+        unlink(CONFIG_PATH);
+        return;
     }
-    return NO;
+
+    // Fall back to environment variables (used by LLDB injection)
+    const char *env_mode = getenv("INSTANTSPACES_MODE");
+    if (env_mode) strncpy(g_mode, env_mode, sizeof(g_mode) - 1);
+
+    const char *env_features = getenv("INSTANTSPACES_FEATURES");
+    if (env_features) strncpy(g_features, env_features, sizeof(g_features) - 1);
 }
 
-// All pattern definitions
-// Spaces: patch first instruction (fmov d0, #0.5 -> our d0 replacement)
-// Minimize: patch first instruction (fmov s8, w8 -> our d8 replacement)
-//
-// Format: {pattern, patch_offset, name, feature, os_target, os_fallback}
-// - os_target: primary OS version this pattern is for
-// - os_fallback: if os_target patterns find nothing, try patterns with this as os_target
-static PatternSpec g_all_patterns[] = {
-    // Spaces switching patterns (patch at offset 0, targets d0)
-    // Sonoma primary, Sequoia fallback
-    {"00 10 6A 1E E0 03 14 AA ?? 03 ?? AA", 0, "spaces-sonoma",   FEATURE_SPACES, OS_SONOMA,  OS_SEQUOIA},
-    // Sequoia primary, Sonoma fallback
-    {"00 10 6A 1E A8 ?? ?? D1 ?? 01 ?? F8", 0, "spaces-sequoia",  FEATURE_SPACES, OS_SEQUOIA, OS_SONOMA},
-
-    // Minimize patterns (patch at offset 0 - the fmov s8/s0, w8 instruction, targets d8)
-    // These appear to work across versions (OS_ANY)
-    {"E1 87 00 AD 08 1C 28 1E", 4, "minimize", FEATURE_MINIMIZE, OS_ANY, OS_ANY},
-    {"08 0D 20 1E 00 E4 00 6F E0 83 01 AD", 0, "maximize", FEATURE_MINIMIZE, OS_ANY, OS_ANY}
-};
-static const int g_pattern_count = sizeof(g_all_patterns) / sizeof(g_all_patterns[0]);
-
-// Get current macOS major version
-static int get_os_major_version(void) {
+static int get_macos_version(void) {
     static int cached = -1;
     if (cached < 0) {
         NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
@@ -119,226 +176,305 @@ static int get_os_major_version(void) {
     return cached;
 }
 
-// Check if pattern should be tried for current OS
-// pass=0: try patterns matching current OS or OS_ANY
-// pass=1: try fallback patterns (where os_fallback matches current OS)
-static BOOL pattern_matches_os(PatternSpec *spec, int pass) {
-    int os = get_os_major_version();
-    if (pass == 0) {
-        // Primary pass: match os_target == current OS or OS_ANY
-        return (spec->os_target == OS_ANY || spec->os_target == os);
-    } else {
-        // Fallback pass: match os_fallback == current OS
-        return (spec->os_fallback == os);
-    }
-}
-
-// Parse INSTANTSPACES_FEATURES env var: "all" (default), "spaces", "minimize"
 static FeatureFlags get_enabled_features(void) {
-    const char *feat = getenv("INSTANTSPACES_FEATURES");
-    if (!feat || strcmp(feat, "all") == 0) return FEATURE_ALL;
-    if (strcmp(feat, "spaces") == 0) return FEATURE_SPACES;
-    if (strcmp(feat, "minimize") == 0) return FEATURE_MINIMIZE;
+    if (strcmp(g_features, "spaces") == 0) return FEATURE_SPACES;
+    if (strcmp(g_features, "minimize") == 0) return FEATURE_MINIMIZE;
     return FEATURE_ALL;
 }
-static inline uint64_t page_align(uint64_t x){ return x & ~(uint64_t)(vm_page_size-1); }
 
-// Record patched sites
-static uint64_t g_patched_sites[64];
-static int g_patched_count = 0;
-
-static void record_patched(uint64_t addr){
-    if(g_patched_count < (int)(sizeof(g_patched_sites)/sizeof(g_patched_sites[0]))){
-        g_patched_sites[g_patched_count++] = addr;
-    }
-}
-
-// Select patch opcode by env var: INSTANTSPACES_MODE = "zero" | "min0125"
-// For spaces: patches d0
-// For minimize: patches d8
-static uint32_t pick_patch_insn_d0(void){
-    const char *mode = getenv("INSTANTSPACES_MODE");
-    if (mode && strcmp(mode, "min0125") == 0) {
-        // fmov d0, #0.125
-        return 0x1e681000;
-    }
-    // default: zero duration
-    // movi d0, #0
-    return 0x2f00e400;
-}
-
-static uint32_t pick_patch_insn_d8(void){
-    const char *mode = getenv("INSTANTSPACES_MODE");
-    if (mode && strcmp(mode, "min0125") == 0) {
-        // fmov d8, #0.125
-        return 0x1e681008;
-    }
-    // default: zero duration
-    // movi d8, #0
-    return 0x2f00e408;
-}
-
-// Try to patch a single pattern, returns number of sites patched
-static int try_patch_pattern(PatternSpec *spec, uint64_t text_start, uint64_t text_size,
-                             uint32_t patchInsn_d0, uint32_t patchInsn_d8,
-                             int *spaces_patched, int *minimize_patched) {
-    unsigned char pat[128], msk[128];
-    size_t plen = parse_pattern(spec->pattern, pat, msk, sizeof(pat));
-    if (!plen) return 0;
-
-    // Select patch instruction based on feature
-    // Spaces patches d0, Minimize patches d8
-    uint32_t patchInsn = (spec->feature & FEATURE_MINIMIZE) ? patchInsn_d8 : patchInsn_d0;
-    // uint32_t patchInsn = patchInsn_d0;
-
-    int patched = 0;
-    size_t start_off = 0;
-    while (1) {
-        size_t off = search_buf((const unsigned char*)(uintptr_t)text_start,
-                                (size_t)text_size, pat, msk, plen, start_off);
-        if (off == SIZE_MAX) break;
-
-        // Calculate patch target: match start + patch_offset
-        uint64_t match_start = text_start + off;
-        uint64_t patch_addr = match_start + spec->patch_offset;
-        uint32_t before = *(volatile uint32_t*)patch_addr;
-
-        kern_return_t kr = vm_protect(mach_task_self(), page_align(patch_addr),
-                                      vm_page_size, 0, VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY);
-        if (kr != KERN_SUCCESS) {
-            log_line("vm_protect RW failed @0x%llx: %d", (unsigned long long)patch_addr, kr);
-            return patched;
-        }
-
-        *(volatile uint32_t*)patch_addr = patchInsn;
-        sys_icache_invalidate((void*)(uintptr_t)patch_addr, sizeof(uint32_t));
-        __builtin___clear_cache((char*)(uintptr_t)patch_addr,
-                                (char*)(uintptr_t)(patch_addr + sizeof(uint32_t)));
-        (void)vm_protect(mach_task_self(), page_align(patch_addr), vm_page_size, 0,
-                         VM_PROT_READ|VM_PROT_EXECUTE);
-
-        uint32_t after = *(volatile uint32_t*)patch_addr;
-        log_line("Patched [%s] @0x%llx: before=0x%08x after=0x%08x",
-                 spec->name, (unsigned long long)patch_addr, before, after);
-        record_patched(patch_addr);
-        patched++;
-
-        // Track per-feature counts
-        if (spec->feature & FEATURE_SPACES) (*spaces_patched)++;
-        if (spec->feature & FEATURE_MINIMIZE) (*minimize_patched)++;
-
-        start_off = off + 1;
-    }
-    return patched;
-}
-
-static int patch_all_hits_in_text(uint64_t text_start, uint64_t text_size) {
-    const FeatureFlags enabled = get_enabled_features();
-    const uint32_t patchInsn_d0 = pick_patch_insn_d0();
-    const uint32_t patchInsn_d8 = pick_patch_insn_d8();
-    int total_patched = 0;
-    int spaces_patched = 0;
-    int minimize_patched = 0;
-
-    log_line("Running on macOS %d", get_os_major_version());
-
-    // Two-pass approach:
-    // Pass 0: Try patterns targeting current OS (or OS_ANY)
-    // Pass 1: Try fallback patterns if primary pass found nothing for a feature
-    int spaces_found_primary = 0;
-    int minimize_found_primary = 0;
-
-    for (int pass = 0; pass <= 1; pass++) {
-        const char *pass_name = (pass == 0) ? "primary" : "fallback";
-
-        for (int i = 0; i < g_pattern_count; i++) {
-            PatternSpec *spec = &g_all_patterns[i];
-
-            // Skip patterns for disabled features
-            if (!(spec->feature & enabled)) continue;
-
-            // Skip if this pattern doesn't match current pass criteria
-            if (!pattern_matches_os(spec, pass)) continue;
-
-            // On fallback pass, skip features that already found matches
-            if (pass == 1) {
-                if ((spec->feature & FEATURE_SPACES) && spaces_found_primary) continue;
-                if ((spec->feature & FEATURE_MINIMIZE) && minimize_found_primary) continue;
-            }
-
-            int before_spaces = spaces_patched;
-            int before_minimize = minimize_patched;
-
-            int count = try_patch_pattern(spec, text_start, text_size,
-                                          patchInsn_d0, patchInsn_d8,
-                                          &spaces_patched, &minimize_patched);
-            if (count > 0) {
-                log_line("Pattern [%s] matched %d site(s) (%s pass)", spec->name, count, pass_name);
-                total_patched += count;
-            }
-
-            // Track if primary pass found matches per feature
-            if (pass == 0) {
-                if (spaces_patched > before_spaces) spaces_found_primary = 1;
-                if (minimize_patched > before_minimize) minimize_found_primary = 1;
-            }
-        }
-    }
-
-    log_line("Patched breakdown: spaces=%d, minimize=%d", spaces_patched, minimize_patched);
-    return total_patched;
-}
-
-static const char* features_to_str(FeatureFlags f) {
+static const char *features_str(FeatureFlags f) {
     if (f == FEATURE_ALL) return "all";
     if (f == FEATURE_SPACES) return "spaces";
     if (f == FEATURE_MINIMIZE) return "minimize";
     return "none";
 }
 
-__attribute__((visibility("default"))) int instantspaces_patch(void) {
+// Returns replacement instruction for the given register
+// Mode: "zero" = movi #0, "min0125" = fmov #0.125
+static uint32_t get_patch_instruction(unsigned int reg) {
+    if (reg > 31) {
+        log_line("Invalid register number %u (must be 0-31)", reg);
+        reg = 0;
+    }
+
+    BOOL use_min0125 = strcmp(g_mode, "min0125") == 0;
+    uint32_t base = use_min0125 ? 0x1e681000u   // fmov d_, #0.125
+                                : 0x2f00e400u;  // movi d_, #0
+    return base | reg;
+}
+
+// ============================================================================
+#pragma mark - Pattern Matching
+// ============================================================================
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+// Parse hex pattern string into bytes and mask arrays
+// Returns number of bytes parsed
+static size_t parse_pattern(const char *hex, uint8_t *bytes, uint8_t *mask, size_t capacity) {
+    size_t n = 0;
+    const char *p = hex;
+
+    while (*p && n < capacity) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+
+        if (p[0] == '?' && p[1] == '?') {
+            bytes[n] = 0;
+            mask[n] = 0;  // Wildcard - don't compare
+            n++;
+            p += 2;
+        } else {
+            int hi = hexval(p[0]);
+            int lo = hexval(p[1]);
+            if (hi < 0 || lo < 0) break;
+            bytes[n] = (uint8_t)((hi << 4) | lo);
+            mask[n] = 1;  // Must match
+            n++;
+            p += 2;
+        }
+        if (*p == ' ') p++;
+    }
+    return n;
+}
+
+// Search buffer for pattern, respecting mask. Returns offset or SIZE_MAX if not found.
+static size_t find_pattern(const uint8_t *buf, size_t buflen,
+                           const uint8_t *pattern, const uint8_t *mask, size_t patlen,
+                           size_t start_offset) {
+    if (!buf || patlen == 0 || buflen < patlen || start_offset > buflen - patlen) {
+        return SIZE_MAX;
+    }
+
+    size_t limit = buflen - patlen;
+    for (size_t i = start_offset; i <= limit; i++) {
+        BOOL match = YES;
+        for (size_t j = 0; j < patlen; j++) {
+            if (mask[j] && buf[i + j] != pattern[j]) {
+                match = NO;
+                break;
+            }
+        }
+        if (match) return i;
+    }
+    return SIZE_MAX;
+}
+
+// ============================================================================
+#pragma mark - Mach-O Parsing
+// ============================================================================
+
+// Locate Dock's __TEXT segment in memory
+static BOOL find_dock_text(uint64_t *text_start, uint64_t *text_size) {
+    uint32_t image_count = _dyld_image_count();
+
+    for (uint32_t i = 0; i < image_count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "/Dock.app/Contents/MacOS/Dock")) continue;
+
+        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!header || header->magic != MH_MAGIC_64) continue;
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        const uint8_t *cmd_ptr = (const uint8_t *)(header + 1);
+
+        for (uint32_t c = 0; c < header->ncmds; c++) {
+            const struct load_command *cmd = (const struct load_command *)cmd_ptr;
+            if (cmd->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd_ptr;
+                if (strcmp(seg->segname, "__TEXT") == 0) {
+                    *text_start = seg->vmaddr + (uint64_t)slide;
+                    *text_size = seg->vmsize;
+                    return YES;
+                }
+            }
+            cmd_ptr += cmd->cmdsize;
+        }
+    }
+    return NO;
+}
+
+// ============================================================================
+#pragma mark - Memory Patching
+// ============================================================================
+
+static inline uint64_t page_start(uint64_t addr) {
+    return addr & ~(uint64_t)(vm_page_size - 1);
+}
+
+// Make memory page writable for patching
+static BOOL make_writable(uint64_t addr) {
+    kern_return_t kr = vm_protect(mach_task_self(), page_start(addr), vm_page_size, 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        log_line("vm_protect RW failed @0x%llx: %d", (unsigned long long)addr, kr);
+        return NO;
+    }
+    return YES;
+}
+
+// Restore memory page to executable
+static void make_executable(uint64_t addr) {
+    vm_protect(mach_task_self(), page_start(addr), vm_page_size, 0,
+               VM_PROT_READ | VM_PROT_EXECUTE);
+}
+
+// Write instruction and flush caches
+static void write_instruction(uint64_t addr, uint32_t instruction) {
+    *(volatile uint32_t *)addr = instruction;
+    sys_icache_invalidate((void *)(uintptr_t)addr, sizeof(uint32_t));
+    __builtin___clear_cache((char *)(uintptr_t)addr,
+                            (char *)(uintptr_t)(addr + sizeof(uint32_t)));
+}
+
+static void record_patch(uint64_t addr) {
+    if (g_patched_count < (int)(sizeof(g_patched_addrs) / sizeof(g_patched_addrs[0]))) {
+        g_patched_addrs[g_patched_count++] = addr;
+    }
+}
+
+// ============================================================================
+#pragma mark - Patching Engine
+// ============================================================================
+
+// Check if pattern applies to current macOS version
+static BOOL pattern_matches_os(PatternSpec *spec) {
+    int os = get_macos_version();
+    BOOL above_min = (spec->os_min == 0) || (os >= spec->os_min);
+    BOOL below_max = (spec->os_max == 0) || (os <= spec->os_max);
+    return above_min && below_max;
+}
+
+// Apply patches for a single pattern specification
+static int apply_pattern(PatternSpec *spec, uint64_t text_start, uint64_t text_size,
+                         int *spaces_count, int *minimize_count) {
+    uint8_t pattern_bytes[128];
+    uint8_t pattern_mask[128];
+    size_t pattern_len = parse_pattern(spec->pattern, pattern_bytes, pattern_mask, sizeof(pattern_bytes));
+    if (pattern_len == 0) return 0;
+
+    // Spaces patches d0, minimize patches d8
+    int reg = (spec->feature & FEATURE_MINIMIZE) ? 8 : 0;
+    uint32_t replacement = get_patch_instruction(reg);
+
+    int patched = 0;
+    size_t search_offset = 0;
+
+    while (1) {
+        size_t match = find_pattern((const uint8_t *)(uintptr_t)text_start, (size_t)text_size,
+                                    pattern_bytes, pattern_mask, pattern_len, search_offset);
+        if (match == SIZE_MAX) break;
+
+        uint64_t patch_addr = text_start + match + spec->patch_offset;
+        uint32_t before = *(volatile uint32_t *)patch_addr;
+
+        if (!make_writable(patch_addr)) break;
+
+        write_instruction(patch_addr, replacement);
+        make_executable(patch_addr);
+
+        uint32_t after = *(volatile uint32_t *)patch_addr;
+        log_line("Patched [%s] @0x%llx: 0x%08x -> 0x%08x",
+                 spec->name, (unsigned long long)patch_addr, before, after);
+
+        record_patch(patch_addr);
+        patched++;
+
+        if (spec->feature & FEATURE_SPACES) (*spaces_count)++;
+        if (spec->feature & FEATURE_MINIMIZE) (*minimize_count)++;
+
+        search_offset = match + 1;
+    }
+    return patched;
+}
+
+// Apply all applicable patterns for current OS
+static int patch_dock_text(uint64_t text_start, uint64_t text_size) {
+    FeatureFlags enabled = get_enabled_features();
+    int total = 0;
+    int spaces_count = 0;
+    int minimize_count = 0;
+
+    log_line("macOS version: %d", get_macos_version());
+
+    for (int i = 0; i < g_pattern_count; i++) {
+        PatternSpec *spec = &g_patterns[i];
+
+        // Skip disabled features
+        if (!(spec->feature & enabled)) continue;
+
+        // Skip patterns not applicable to this OS version
+        if (!pattern_matches_os(spec)) continue;
+
+        int count = apply_pattern(spec, text_start, text_size, &spaces_count, &minimize_count);
+        if (count > 0) {
+            log_line("[%s] %d match(es)", spec->name, count);
+            total += count;
+        }
+    }
+
+    log_line("Patched: spaces=%d, minimize=%d", spaces_count, minimize_count);
+    return total;
+}
+
+// ============================================================================
+#pragma mark - Public API
+// ============================================================================
+
+__attribute__((visibility("default")))
+int instantspaces_patch(void) {
 #if !defined(__arm64__)
     return 1;
 #else
     @autoreleasepool {
-        const char *mode = getenv("INSTANTSPACES_MODE");
+        load_config();
         FeatureFlags features = get_enabled_features();
-        log_line("instantspaces_patch: entered (mode=%s, features=%s)",
-                 mode ? mode : "zero", features_to_str(features));
+        log_line("instantspaces_patch started (mode=%s, features=%s)",
+                 g_mode, features_str(features));
 
         uint64_t text_start = 0, text_size = 0;
         if (!find_dock_text(&text_start, &text_size)) {
-            log_line("Failed to find Dock __TEXT; abort.");
+            log_line("Failed to locate Dock __TEXT segment");
             return 1;
         }
-        log_line("Dock __TEXT=[0x%llx..0x%llx)",
-                 (unsigned long long)text_start, (unsigned long long)(text_start + text_size));
+        log_line("Dock __TEXT: 0x%llx - 0x%llx (%llu bytes)",
+                 (unsigned long long)text_start,
+                 (unsigned long long)(text_start + text_size),
+                 (unsigned long long)text_size);
 
         g_patched_count = 0;
-        int count = patch_all_hits_in_text(text_start, text_size);
-        log_line("Total sites patched: %d", count);
+        int count = patch_dock_text(text_start, text_size);
+        log_line("Total patches applied: %d", count);
+
         return count > 0 ? 0 : 2;
     }
 #endif
 }
 
-__attribute__((visibility("default"))) int instantspaces_verify(void){
+__attribute__((visibility("default")))
+int instantspaces_verify(void) {
 #if !defined(__arm64__)
     return 1;
 #else
     @autoreleasepool {
-        log_line("Verify: patched_count=%d", g_patched_count);
-        for(int i=0;i<g_patched_count;i++){
-            uint64_t addr = g_patched_sites[i];
-            uint32_t val = *(volatile uint32_t*)addr;
-            log_line("Verify patched @0x%llx => 0x%08x", (unsigned long long)addr, val);
+        log_line("Verifying %d patched sites", g_patched_count);
+        for (int i = 0; i < g_patched_count; i++) {
+            uint64_t addr = g_patched_addrs[i];
+            uint32_t val = *(volatile uint32_t *)addr;
+            log_line("  [%d] @0x%llx = 0x%08x", i, (unsigned long long)addr, val);
         }
         return g_patched_count;
     }
 #endif
 }
 
-__attribute__((constructor)) static void ctor(void){
-    log_line("constructor: payload loaded into Dock pid=%d", getpid());
-    (void)instantspaces_patch();
+__attribute__((constructor))
+static void payload_init(void) {
+    log_line("Payload loaded into Dock (pid=%d)", getpid());
+    instantspaces_patch();
 }

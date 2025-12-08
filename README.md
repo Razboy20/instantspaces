@@ -1,128 +1,157 @@
 # instantspaces
 
-Disable macOS Desktop Spaces switching animation by patching Dock **in-process** with a tiny scripting addition payload. Supports:
-- macOS: 14 (Sonoma) and 15 (Sequoia)
-- Arch: Apple Silicon (arm64e)
-- Modes:
-  - zero: force 0.0s (instant)
-  - min0125: force 0.125s using a single-instruction FP immediate 
-- Requires: SIP disabled, Xcode Command Line Tools
+Patches macOS Dock in-process to reduce animation durations for:
+- **Spaces switching** - Desktop/Space transitions
+- **Window minimize/unminimize** - Scale and Shrink effects
 
-The whole patching mechanism is based on [yabai](https://github.com/koekeishiya/yabai)'s scripting addition. I just wanted to have it stand-alone to fix an issue with [redrawing of floating windows](https://github.com/koekeishiya/yabai/issues/2491).
+| | |
+|---|---|
+| **macOS** | 14 (Sonoma), 15 (Sequoia) |
+| **Arch** | Apple Silicon (arm64e) |
+| **Requires** | SIP disabled, Xcode Command Line Tools |
 
-<details>
-<summary>⁉️ How did I fix it?</summary>
-<br>
+Based on [yabai](https://github.com/koekeishiya/yabai)'s scripting addition injection technique.
 
-> The Spaces switching animation duration is being set to zero and probably fucks around with the compositor rendering phases, so that floating windows or popups are not being redrawn. Only way to fix this is triggering a redraw which is cumbersome
->
-> So I set a very small animation duration frame of 0.125 seconds that still allows for redraws but is faster than stock.
+## Quick Start
 
-</details>
+```bash
+# Build and install
+make install
 
-## Inject and patch
+# Restart Dock and inject
+make restart
 
-We recommend restarting Dock first, then injecting and patching twice (our script does two patch passes followed by verify). Patching twice works around rare attach or timing hiccups.
-
-```sh
-# Restart Dock so we patch early
-killall Dock
-
-# Inject and patch with a mode:
-#   zero    -> 0.0s animation (instant)
-#   min0125 -> 0.125s animation (near-instant; helps floating windows)
-sudo ./scripts/inject.sh min0125
-# or
-sudo ./scripts/inject.sh zero
+# Or just inject into running Dock
+make inject
 ```
 
-What the injector does
-- Sets INSTANTSPACES_MODE inside the Dock process
-- dlopen()s the payload
-- Calls instantspaces_patch() twice in a row
-- Calls instantspaces_verify() to list/confirm patched sites
+## Installation
 
-Check logs
-- Console.app: filter “Dock” and “[instantspaces]”
-- File log: /private/var/tmp/instantspaces.<DockPID>.log
+### Prerequisites
 
-You’ll see messages like:
-```
-[instantspaces] constructor: payload loaded into Dock pid=...
-[instantspaces] instantspaces_patch: entered (mode=min0125)
-[instantspaces] Dock __TEXT=[0x... .. 0x... )
-[instantspaces] Patched site @0x...: before=0x..., after=0x1e681000
-[instantspaces] Total sites patched: 2
-[instantspaces] Verify: patched_count=2
-[instantspaces] Verify patched @0x... => 0x1e681000
-```
+1. **Disable SIP** - Boot to Recovery Mode, run:
+   ```bash
+   csrutil enable --without fs --without debug --without nvram
+   ```
 
-## Modes
+2. **Install Xcode Command Line Tools**:
+   ```bash
+   # although technically running `make` will install this as well
+   xcode-select --install
+   ```
 
-- zero
-  - Writes opcode 0x2f00e400 at matched sites (forces duration register to 0.0)
-  - Fastest visually, but can cause “floating” windows to momentarily disappear for some users
-- min0125
-  - Writes opcode 0x1e681000 (fmov d0, #0.125) at matched sites
-  - Keeps transitions near-instant while ensuring the compositor gets a frame to redraw
+### Build & Install
 
-Switching modes
-- Modes are set per injection. To change, restart Dock and re-run the inject script with the desired mode:
-  - killall Dock; sudo ./scripts/inject.sh min0125
-
-## Auto-run at login (LaunchAgent)
-
-To inject automatically on login (and after Dock relaunches), install a per-user LaunchAgent that runs a small retrying injector wrapper.
-
-1) Edit scripts/auto-inject.sh to choose your default mode (zero or min0125). It already retries multiple times.
-2) Copy and adjust the LaunchAgent (update the absolute path to your repo):
-   - In eu.flawn.instantspaces.inject.plist, set the ProgramArguments path to your auto-inject.sh.
-3) Install and load:
-
-```sh
-# Create ~/Library/LaunchAgents if needed
-mkdir -p ~/Library/LaunchAgents
-
-# Copy the plist
-cp eu.flawn.instantspaces.inject.plist ~/Library/LaunchAgents/
-
-# Load (for the current user session)
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/eu.flawn.instantspaces.inject.plist
-launchctl enable gui/$UID/eu.flawn.instantspaces.inject
-launchctl kickstart -k gui/$UID/eu.flawn.instantspaces.inject
+```bash
+make install
 ```
 
-To unload/disable:
-```sh
-launchctl bootout gui/$UID ~/Library/LaunchAgents/eu.flawn.instantspaces.inject.plist
-launchctl disable gui/$UID/eu.flawn.instantspaces.inject
+This installs to `/Library/ScriptingAdditions/instantspaces.osax/`.
+
+## Usage
+
+### Manual Injection
+
+```bash
+# Inject with defaults (mode=zero, features=all)
+make inject
+
+# Restart Dock and inject
+make restart
+
+# Custom mode and features
+make inject MODE=min0125 FEATURES=spaces
 ```
 
-Notes
-- The agent runs in your user session (Dock is per-user). It will attempt injection repeatedly for a short window after login and also if Dock restarts.
-- On first use, macOS may prompt to allow Terminal/LLDB under Privacy & Security > Developer Tools. Run the injector once manually if prompts do not appear in background.
+### Modes
+
+| Mode | Duration | Description |
+|------|----------|-------------|
+| `zero` | 0.0s | Instant (default) |
+| `min0125` | 0.125s | Near-instant, helps with floating window redraw issues |
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| `all` | Patch everything (default) |
+| `spaces` | Only Spaces switching animations |
+| `minimize` | Only window minimize/unminimize |
+
+### Auto-Injection Service
+
+Install a LaunchDaemon to automatically inject when Dock starts:
+
+```bash
+# Install service
+make service-install
+
+# Check status
+make service-status
+
+# Remove service
+make service-remove
+```
+
+## Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `make` | Build payload and loader |
+| `make install` | Install to /Library/ScriptingAdditions |
+| `make inject` | Inject into running Dock |
+| `make restart` | Restart Dock and inject |
+| `make service-install` | Install auto-injection service |
+| `make service-remove` | Remove auto-injection service |
+| `make service-status` | Check service status |
+| `make uninstall` | Remove everything |
+| `make logs` | Show payload logs |
+| `make clean` | Remove build artifacts |
+
+## Logs
+
+```bash
+# View logs
+make logs
+
+# Or check Console.app with filter: instantspaces
+# Or: /private/var/tmp/instantspaces.<PID>.log
+```
+
+Expected output:
+```
+[instantspaces] Payload loaded into Dock (pid=1234)
+[instantspaces] instantspaces_patch started (mode=zero, features=all)
+[instantspaces] Dock __TEXT: 0x... - 0x... (... bytes)
+[instantspaces] Patched [spaces-sequoia] @0x...: 0x... -> 0x2f00e400
+[instantspaces] Patched: spaces=2, minimize=4
+[instantspaces] Total patches applied: 6
+```
 
 ## Uninstall
 
-```sh
-# Optional: unload agent if installed
-launchctl bootout gui/$UID ~/Library/LaunchAgents/eu.flawn.instantspaces.inject.plist 2>/dev/null || true
-rm -f ~/Library/LaunchAgents/eu.flawn.instantspaces.inject.plist
-
-# Remove the osax payload
-./scripts/uninstall.sh
+```bash
+make uninstall
 ```
 
 ## Troubleshooting
 
-- dlopen returns NULL:
-  - Ensure the payload is arm64e (our Makefile builds arm64e)
-  - Clear quarantine and ad-hoc sign (install.sh and make install do this)
-  - Run once manually to grant Developer Tools permission (Terminal/LLDB)
-- EXC_BREAKPOINT during LLDB expr:
-  - Retry inject; our script patches twice by default to withstand occasional attach hiccups
-  - Ensure SIP is relaxed consistently, and “Displays have separate Spaces” is enabled in System Settings > Desktop & Dock
-- Animation still present:
-  - Use min0125 mode for stability if floaters disappear on zero
-  - Confirm Console shows “Total sites patched: 2” (or more) and Verify entries
-  - Kill Dock and inject again to patch earlier in its lifecycle
+**Injection fails / dlopen returns NULL:**
+- Ensure SIP is disabled: `csrutil status`
+- Grant Developer Tools permission (Terminal/LLDB) in System Settings > Privacy & Security
+- Run `make install` to ensure proper signing
+
+**Animation still present:**
+- Check logs show patches were applied
+- Try `make restart` to patch early in Dock lifecycle
+- Ensure "Displays have separate Spaces" is enabled in System Settings > Desktop & Dock
+
+**Floating windows disappear (zero mode):**
+- Use `min0125` mode: `make inject MODE=min0125`
+- This gives the compositor a frame to redraw
+
+## How It Works
+
+The payload searches for ARM64 instruction patterns that control animation durations in Dock's `__TEXT` segment, then patches them to load immediate values (0.0 or 0.125) instead of the original duration.
+
+Injection uses LLDB by default. If `nvram boot-args` contains `arm64e_preview_abi`, a faster Mach-based loader is used instead.
