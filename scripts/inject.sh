@@ -26,8 +26,6 @@ echo "Injecting into Dock (pid ${PID}) with mode=$MODE, features=$FEATURES"
   -o "expr (int)setenv(\"INSTANTSPACES_FEATURES\",\"$FEATURES\",1)" \
   -o "expr (void*)dlopen(\"$PAYLOAD\", 2)" \
   -o 'expr (char*)dlerror()' \
-  -o 'expr -- { void *(*my_dlsym)(void*, const char*) = (void*(*)(void*,const char*))dlsym; void *ps = my_dlsym((void*)-2,"instantspaces_patch"); (int)((ps)?((int(*)(void))ps)():-1); }' \
-  -o 'expr -- { void *(*my_dlsym)(void*, const char*) = (void*(*)(void*,const char*))dlsym; void *ps = my_dlsym((void*)-2,"instantspaces_patch"); (int)((ps)?((int(*)(void))ps)():-1); }' \
   -o 'expr -- { void *(*my_dlsym)(void*, const char*) = (void*(*)(void*,const char*))dlsym; void *vs = my_dlsym((void*)-2,"instantspaces_verify"); (int)((vs)?((int(*)(void))vs)():-1); }' \
   -o 'process detach' \
   -o 'quit'

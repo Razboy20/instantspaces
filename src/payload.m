@@ -89,24 +89,23 @@ static BOOL find_dock_text(uint64_t *out_text_start,uint64_t *out_text_size){
 }
 
 // All pattern definitions
-// Spaces: patch first instruction (fmov d0, #0.5 -> our replacement)
-// Minimize: patch second instruction at offset 4 (fmov d0, d8 -> our replacement)
+// Spaces: patch first instruction (fmov d0, #0.5 -> our d0 replacement)
+// Minimize: patch first instruction (fmov s8, w8 -> our d8 replacement)
 //
 // Format: {pattern, patch_offset, name, feature, os_target, os_fallback}
 // - os_target: primary OS version this pattern is for
 // - os_fallback: if os_target patterns find nothing, try patterns with this as os_target
 static PatternSpec g_all_patterns[] = {
-    // Spaces switching patterns (patch at offset 0)
+    // Spaces switching patterns (patch at offset 0, targets d0)
     // Sonoma primary, Sequoia fallback
     {"00 10 6A 1E E0 03 14 AA ?? 03 ?? AA", 0, "spaces-sonoma",   FEATURE_SPACES, OS_SONOMA,  OS_SEQUOIA},
     // Sequoia primary, Sonoma fallback
     {"00 10 6A 1E A8 ?? ?? D1 ?? 01 ?? F8", 0, "spaces-sequoia",  FEATURE_SPACES, OS_SEQUOIA, OS_SONOMA},
 
-    // Minimize patterns (patch at offset 4 - the fmov d0, d8 instruction)
+    // Minimize patterns (patch at offset 0 - the fmov s8/s0, w8 instruction, targets d8)
     // These appear to work across versions (OS_ANY)
-    {"28 1C 60 1E 00 41 60 1E", 4, "minimize-scale",  FEATURE_MINIMIZE, OS_ANY, OS_ANY},
-    {"08 1C 61 1E 00 41 60 1E", 4, "minimize-shrink", FEATURE_MINIMIZE, OS_ANY, OS_ANY},
-    // TODO: Genie mode pattern
+    {"E1 87 00 AD 08 1C 28 1E", 4, "minimize", FEATURE_MINIMIZE, OS_ANY, OS_ANY},
+    {"08 0D 20 1E 00 E4 00 6F E0 83 01 AD", 0, "maximize", FEATURE_MINIMIZE, OS_ANY, OS_ANY}
 };
 static const int g_pattern_count = sizeof(g_all_patterns) / sizeof(g_all_patterns[0]);
 
@@ -155,23 +154,42 @@ static void record_patched(uint64_t addr){
 }
 
 // Select patch opcode by env var: INSTANTSPACES_MODE = "zero" | "min0125"
-static uint32_t pick_patch_insn(void){
+// For spaces: patches d0
+// For minimize: patches d8
+static uint32_t pick_patch_insn_d0(void){
     const char *mode = getenv("INSTANTSPACES_MODE");
     if (mode && strcmp(mode, "min0125") == 0) {
         // fmov d0, #0.125
         return 0x1e681000;
     }
-    // default: zero duration (current behavior)
-    // movi d0, #0 (as used by yabai Write)
+    // default: zero duration
+    // movi d0, #0
     return 0x2f00e400;
+}
+
+static uint32_t pick_patch_insn_d8(void){
+    const char *mode = getenv("INSTANTSPACES_MODE");
+    if (mode && strcmp(mode, "min0125") == 0) {
+        // fmov d8, #0.125
+        return 0x1e681008;
+    }
+    // default: zero duration
+    // movi d8, #0
+    return 0x2f00e408;
 }
 
 // Try to patch a single pattern, returns number of sites patched
 static int try_patch_pattern(PatternSpec *spec, uint64_t text_start, uint64_t text_size,
-                             uint32_t patchInsn, int *spaces_patched, int *minimize_patched) {
+                             uint32_t patchInsn_d0, uint32_t patchInsn_d8,
+                             int *spaces_patched, int *minimize_patched) {
     unsigned char pat[128], msk[128];
     size_t plen = parse_pattern(spec->pattern, pat, msk, sizeof(pat));
     if (!plen) return 0;
+
+    // Select patch instruction based on feature
+    // Spaces patches d0, Minimize patches d8
+    uint32_t patchInsn = (spec->feature & FEATURE_MINIMIZE) ? patchInsn_d8 : patchInsn_d0;
+    // uint32_t patchInsn = patchInsn_d0;
 
     int patched = 0;
     size_t start_off = 0;
@@ -216,7 +234,8 @@ static int try_patch_pattern(PatternSpec *spec, uint64_t text_start, uint64_t te
 
 static int patch_all_hits_in_text(uint64_t text_start, uint64_t text_size) {
     const FeatureFlags enabled = get_enabled_features();
-    const uint32_t patchInsn = pick_patch_insn();
+    const uint32_t patchInsn_d0 = pick_patch_insn_d0();
+    const uint32_t patchInsn_d8 = pick_patch_insn_d8();
     int total_patched = 0;
     int spaces_patched = 0;
     int minimize_patched = 0;
@@ -250,7 +269,8 @@ static int patch_all_hits_in_text(uint64_t text_start, uint64_t text_size) {
             int before_spaces = spaces_patched;
             int before_minimize = minimize_patched;
 
-            int count = try_patch_pattern(spec, text_start, text_size, patchInsn,
+            int count = try_patch_pattern(spec, text_start, text_size,
+                                          patchInsn_d0, patchInsn_d8,
                                           &spaces_patched, &minimize_patched);
             if (count > 0) {
                 log_line("Pattern [%s] matched %d site(s) (%s pass)", spec->name, count, pass_name);
